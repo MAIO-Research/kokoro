@@ -22,7 +22,7 @@ class SLMAdversarialLoss(torch.nn.Module):
         bert_dur = self.model.bert(ref_text, attention_mask=(~text_mask).int())
         d_en = self.model.bert_encoder(bert_dur).transpose(-1, -2) 
         
-        if use_ind and np.random.rand() < 0.5:
+        if self.sampler is None or (use_ind and np.random.rand() < 0.5):
             s_preds = s_trg
         else:
             num_steps = np.random.randint(3, 5)

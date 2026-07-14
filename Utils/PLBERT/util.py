@@ -1,42 +1,35 @@
-import os
-import yaml
 import torch
-from transformers import AlbertConfig, AlbertModel
+from torch import nn
+from munch import Munch
 
-class CustomAlbert(AlbertModel):
-    def forward(self, *args, **kwargs):
-        # Call the original forward method
-        outputs = super().forward(*args, **kwargs)
-
-        # Only return the last_hidden_state
-        return outputs.last_hidden_state
+from models import TextEncoder
 
 
-def load_plbert(log_dir):
-    config_path = os.path.join(log_dir, "config.yml")
-    plbert_config = yaml.safe_load(open(config_path))
-    
-    albert_base_configuration = AlbertConfig(**plbert_config['model_params'])
-    bert = CustomAlbert(albert_base_configuration)
+class PlainTextBERT(nn.Module):
+    """
+    Drop-in replacement for PL-BERT for languages without a pretrained
+    PL-BERT checkpoint (e.g. Armenian). Reuses the same CNN+LSTM TextEncoder
+    architecture as the model's main text encoder, trained from scratch
+    jointly with the rest of the model rather than pretrained separately on
+    raw text. Consumes the same phoneme ids as `model.text_encoder` -- no
+    separate tokenizer/vocab is needed.
+    """
 
-    files = os.listdir(log_dir)
-    ckpts = []
-    for f in os.listdir(log_dir):
-        if f.startswith("step_"): ckpts.append(f)
+    def __init__(self, n_token, hidden_size=512, n_layer=3, max_position_embeddings=512):
+        super().__init__()
+        self.encoder = TextEncoder(channels=hidden_size, kernel_size=5, depth=n_layer, n_symbols=n_token)
+        self.config = Munch(hidden_size=hidden_size, max_position_embeddings=max_position_embeddings)
 
-    iters = [int(f.split('_')[-1].split('.')[0]) for f in ckpts if os.path.isfile(os.path.join(log_dir, f))]
-    iters = sorted(iters)[-1]
+    def forward(self, input_ids, attention_mask):
+        input_lengths = attention_mask.sum(dim=1).long()
+        text_mask = ~attention_mask.bool()
+        out = self.encoder(input_ids, input_lengths, text_mask)  # [B, C, T]
+        return out.transpose(1, 2)  # [B, T, C], matching PL-BERT's output convention
 
-    checkpoint = torch.load(log_dir + "/step_" + str(iters) + ".t7", map_location='cpu')
-    state_dict = checkpoint['net']
-    from collections import OrderedDict
-    new_state_dict = OrderedDict()
-    for k, v in state_dict.items():
-        name = k[7:] # remove `module.`
-        if name.startswith('encoder.'):
-            name = name[8:] # remove `encoder.`
-            new_state_dict[name] = v
-    del new_state_dict["embeddings.position_ids"]
-    bert.load_state_dict(new_state_dict, strict=False)
-    
-    return bert
+
+def load_plbert(model_params):
+    return PlainTextBERT(
+        n_token=model_params.n_token,
+        hidden_size=model_params.hidden_dim,
+        n_layer=model_params.n_layer,
+    )

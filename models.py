@@ -698,8 +698,17 @@ def load_checkpoint(model, optimizer, path, load_only_params=True, ignore_module
     params = state['net']
     for key in model:
         if key in params and key not in ignore_modules:
-            print('%s loaded' % key)
-            model[key].load_state_dict(params[key], strict=False)
+            # unwrap DataParallel so the checkpoint's unprefixed keys match the
+            # module's own keys; loading into the wrapper would look for a
+            # "module." prefix that the checkpoint doesn't have and, with
+            # strict=False, silently load nothing (leaving random init).
+            target = model[key].module if isinstance(model[key], torch.nn.DataParallel) else model[key]
+            ret = target.load_state_dict(params[key], strict=False)
+            if ret.missing_keys or ret.unexpected_keys:
+                print('%s loaded (WARNING: %d missing, %d unexpected keys)'
+                      % (key, len(ret.missing_keys), len(ret.unexpected_keys)))
+            else:
+                print('%s loaded' % key)
     _ = [model[key].eval() for key in model]
     
     if not load_only_params:

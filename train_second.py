@@ -26,9 +26,6 @@ from models import *
 from losses import *
 from utils import *
 
-from Modules.slmadv import SLMAdversarialLoss
-from Modules.diffusion.sampler import DiffusionSampler, ADPM2Sampler, KarrasSchedule
-
 from optimizers import build_optimizer
 
 # simple fix for dataparallel that allows access to class attributes
@@ -114,18 +111,18 @@ def main(config_path):
     ASR_config = config.get('ASR_config', False)
     ASR_path = config.get('ASR_path', False)
     text_aligner = load_ASR_models(ASR_path, ASR_config)
-    
+
     # load pretrained F0 model
     F0_path = config.get('F0_path', False)
     pitch_extractor = load_F0_models(F0_path)
-    
-    # load PL-BERT model
-    BERT_path = config.get('PLBERT_dir', False)
-    plbert = load_plbert(BERT_path)
-    
+
     # build model
     model_params = recursive_munch(config['model_params'])
     multispeaker = model_params.multispeaker
+
+    # load PL-BERT model
+    plbert = load_plbert(model_params)
+
     model = build_model(model_params, text_aligner, pitch_extractor, plbert)
     _ = [model[key].to(device) for key in model]
     
@@ -168,13 +165,6 @@ def main(config_path):
     gl = MyDataParallel(gl)
     dl = MyDataParallel(dl)
     wl = MyDataParallel(wl)
-    
-    sampler = DiffusionSampler(
-        model.diffusion.diffusion,
-        sampler=ADPM2Sampler(),
-        sigma_schedule=KarrasSchedule(sigma_min=0.0001, sigma_max=3.0, rho=9.0), # empirical parameters
-        clamp=False
-    )
     
     scheduler_params = {
         "max_lr": optimizer_params.lr,
@@ -228,18 +218,6 @@ def main(config_path):
     print('decoder', optimizer.optimizers['decoder'])
 
     start_ds = False
-    
-    running_std = []
-    
-    slmadv_params = Munch(config['slmadv_params'])
-    slmadv = SLMAdversarialLoss(model, wl, sampler, 
-                                slmadv_params.min_len, 
-                                slmadv_params.max_len,
-                                batch_percentage=slmadv_params.batch_percentage,
-                                skip_update=slmadv_params.iter, 
-                                sig=slmadv_params.sig
-                               )
-
 
     for epoch in range(start_epoch, epochs):
         running_loss = 0
@@ -307,38 +285,9 @@ def main(config_path):
             s_trg = torch.cat([gs, s_dur], dim=-1).detach() # ground truth for denoiser
 
             bert_dur = model.bert(texts, attention_mask=(~text_mask).int())
-            d_en = model.bert_encoder(bert_dur).transpose(-1, -2) 
-            
-            # denoiser training
-            if epoch >= diff_epoch:
-                num_steps = np.random.randint(3, 5)
-                
-                if model_params.diffusion.dist.estimate_sigma_data:
-                    model.diffusion.module.diffusion.sigma_data = s_trg.std(axis=-1).mean().item() # batch-wise std estimation
-                    running_std.append(model.diffusion.module.diffusion.sigma_data)
-                    
-                if multispeaker:
-                    s_preds = sampler(noise = torch.randn_like(s_trg).unsqueeze(1).to(device), 
-                          embedding=bert_dur,
-                          embedding_scale=1,
-                                   features=ref, # reference from the same speaker as the embedding
-                             embedding_mask_proba=0.1,
-                             num_steps=num_steps).squeeze(1)
-                    loss_diff = model.diffusion(s_trg.unsqueeze(1), embedding=bert_dur, features=ref).mean() # EDM loss
-                    loss_sty = F.l1_loss(s_preds, s_trg.detach()) # style reconstruction loss
-                else:
-                    s_preds = sampler(noise = torch.randn_like(s_trg).unsqueeze(1).to(device), 
-                          embedding=bert_dur,
-                          embedding_scale=1,
-                             embedding_mask_proba=0.1,
-                             num_steps=num_steps).squeeze(1)                    
-                    loss_diff = model.diffusion.module.diffusion(s_trg.unsqueeze(1), embedding=bert_dur).mean() # EDM loss
-                    loss_sty = F.l1_loss(s_preds, s_trg.detach()) # style reconstruction loss
-            else:
-                loss_sty = 0
-                loss_diff = 0
+            d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
 
-            d, p = model.predictor(d_en, s_dur, 
+            d, p = model.predictor(d_en, s_dur,
                                                     input_lengths, 
                                                     s2s_attn_mono, 
                                                     text_mask)
@@ -348,47 +297,65 @@ def main(config_path):
             en = []
             gt = []
             st = []
-            p_en = []
             wav = []
+            random_starts = []
 
             for bib in range(len(mel_input_length)):
                 mel_length = int(mel_input_length[bib].item() / 2)
 
                 random_start = np.random.randint(0, mel_length - mel_len)
+                random_starts.append(random_start)
                 en.append(asr[bib, :, random_start:random_start+mel_len])
-                p_en.append(p[bib, :, random_start:random_start+mel_len])
                 gt.append(mels[bib, :, (random_start * 2):((random_start+mel_len) * 2)])
-                
+
                 y = waves[bib][(random_start * 2) * 300:((random_start+mel_len) * 2) * 300]
                 wav.append(torch.from_numpy(y).to(device))
 
                 # style reference (better to be different from the GT)
-                random_start = np.random.randint(0, mel_length - mel_len_st)
-                st.append(mels[bib, :, (random_start * 2):((random_start+mel_len_st) * 2)])
-                
+                random_start_st = np.random.randint(0, mel_length - mel_len_st)
+                st.append(mels[bib, :, (random_start_st * 2):((random_start_st+mel_len_st) * 2)])
+
             wav = torch.stack(wav).float().detach()
 
             en = torch.stack(en)
-            p_en = torch.stack(p_en)
             gt = torch.stack(gt).detach()
             st = torch.stack(st).detach()
-            
+
             if gt.size(-1) < 80:
                 continue
 
             s_dur = model.predictor_encoder(st.unsqueeze(1) if multispeaker else gt.unsqueeze(1))
             s = model.style_encoder(st.unsqueeze(1) if multispeaker else gt.unsqueeze(1))
-            
+
             with torch.no_grad():
-                F0_real, _, F0 = model.pitch_extractor(gt.unsqueeze(1))
+                # pitch/norm ground truth over the full (batch-padded) sequence, not just the crop
+                F0_real, _, F0 = model.pitch_extractor(mels.unsqueeze(1))
                 F0 = F0.reshape(F0.shape[0], F0.shape[1] * 2, F0.shape[2], 1).squeeze()
 
                 asr_real = model.text_aligner.get_feature(gt)
 
-                N_real = log_norm(gt.unsqueeze(1)).squeeze(1)
-                
+                N_real = log_norm(mels.unsqueeze(1)).squeeze(1)
+
+            # pitch/norm prediction over the full sequence (single F0Ntrain call)
+            F0_fake, N_fake = model.predictor.F0Ntrain(p, s_dur)
+
+            # crop F0_real/N_real/F0_fake/N_fake to the same window as en/gt for the decoder,
+            # instead of separately cropping p before F0Ntrain
+            F0_real_c, N_real_c, F0_fake_c, N_fake_c = [], [], [], []
+            for bib, random_start in enumerate(random_starts):
+                lo, hi = random_start * 2, (random_start + mel_len) * 2
+                F0_real_c.append(F0_real[bib, lo:hi])
+                N_real_c.append(N_real[bib, lo:hi])
+                F0_fake_c.append(F0_fake[bib, lo:hi])
+                N_fake_c.append(N_fake[bib, lo:hi])
+            F0_real_c = torch.stack(F0_real_c)
+            N_real_c = torch.stack(N_real_c)
+            F0_fake_c = torch.stack(F0_fake_c)
+            N_fake_c = torch.stack(N_fake_c)
+
+            with torch.no_grad():
                 y_rec_gt = wav.unsqueeze(1)
-                y_rec_gt_pred = model.decoder(en, F0_real, N_real, s)
+                y_rec_gt_pred = model.decoder(en, F0_real_c, N_real_c, s)
 
                 if epoch >= joint_epoch:
                     # ground truth from recording
@@ -397,12 +364,15 @@ def main(config_path):
                     # ground truth from reconstruction
                     wav = y_rec_gt_pred # use reconstruction since decoder is fixed
 
-            F0_fake, N_fake = model.predictor.F0Ntrain(p_en, s_dur)
+            y_rec = model.decoder(en, F0_fake_c, N_fake_c, s)
 
-            y_rec = model.decoder(en, F0_fake, N_fake, s)
+            # F0Ntrain's output is 2x upsampled from p, which can be a frame or two longer/shorter
+            # than the mel-derived F0_real/N_real after batch padding; clip to the shared length.
+            min_t = min(F0_real.size(-1), F0_fake.size(-1))
+            valid = (~length_to_mask(mel_input_length.clamp(max=min_t))).to(device).float()
 
-            loss_F0_rec =  (F.smooth_l1_loss(F0_real, F0_fake)) / 10
-            loss_norm_rec = F.smooth_l1_loss(N_real, N_fake)
+            loss_F0_rec = (F.smooth_l1_loss(F0_real[..., :min_t], F0_fake[..., :min_t], reduction='none') * valid).sum() / valid.sum() / 10
+            loss_norm_rec = (F.smooth_l1_loss(N_real[..., :min_t], N_fake[..., :min_t], reduction='none') * valid).sum() / valid.sum()
 
             if start_ds:
                 optimizer.zero_grad()
@@ -446,103 +416,36 @@ def main(config_path):
                      loss_params.lambda_norm * loss_norm_rec + \
                      loss_params.lambda_dur * loss_dur + \
                      loss_params.lambda_gen * loss_gen_all + \
-                     loss_params.lambda_slm * loss_lm + \
-                     loss_params.lambda_sty * loss_sty + \
-                     loss_params.lambda_diff * loss_diff
+                     loss_params.lambda_slm * loss_lm
 
             running_loss += loss_mel.item()
-            g_loss.backward()
             if torch.isnan(g_loss):
-                from IPython.core.debugger import set_trace
-                set_trace()
+                def _v(x):
+                    return float(x) if torch.is_tensor(x) else x
+                print('NaN g_loss at epoch %d iter %d -- mel=%s F0=%s ce=%s norm=%s dur=%s gen=%s lm=%s | input_lengths=%s'
+                      % (epoch, i, _v(loss_mel), _v(loss_F0_rec), _v(loss_ce), _v(loss_norm_rec),
+                         _v(loss_dur), _v(loss_gen_all), _v(loss_lm), input_lengths.tolist()))
+                optimizer.zero_grad()
+                continue
+            g_loss.backward()
 
             optimizer.step('bert_encoder')
             optimizer.step('bert')
             optimizer.step('predictor')
             optimizer.step('predictor_encoder')
-            
-            if epoch >= diff_epoch:
-                optimizer.step('diffusion')
-            
+
             if epoch >= joint_epoch:
                 optimizer.step('style_encoder')
                 optimizer.step('decoder')
-        
-                # randomly pick whether to use in-distribution text
-                if np.random.rand() < 0.5:
-                    use_ind = True
-                else:
-                    use_ind = False
-
-                if use_ind:
-                    ref_lengths = input_lengths
-                    ref_texts = texts
-                    
-                slm_out = slmadv(i, 
-                                 y_rec_gt, 
-                                 y_rec_gt_pred, 
-                                 waves, 
-                                 mel_input_length,
-                                 ref_texts, 
-                                 ref_lengths, use_ind, s_trg.detach(), ref if multispeaker else None)
-
-                if slm_out is None:
-                    continue
-                    
-                d_loss_slm, loss_gen_lm, y_pred = slm_out
-                
-                # SLM generator loss
-                optimizer.zero_grad()
-                loss_gen_lm.backward()
-
-                # compute the gradient norm
-                total_norm = {}
-                for key in model.keys():
-                    total_norm[key] = 0
-                    parameters = [p for p in model[key].parameters() if p.grad is not None and p.requires_grad]
-                    for p in parameters:
-                        param_norm = p.grad.detach().data.norm(2)
-                        total_norm[key] += param_norm.item() ** 2
-                    total_norm[key] = total_norm[key] ** 0.5
-
-                # gradient scaling
-                if total_norm['predictor'] > slmadv_params.thresh:
-                    for key in model.keys():
-                        for p in model[key].parameters():
-                            if p.grad is not None:
-                                p.grad *= (1 / total_norm['predictor']) 
-
-                for p in model.predictor.duration_proj.parameters():
-                    if p.grad is not None:
-                        p.grad *= slmadv_params.scale
-
-                for p in model.predictor.lstm.parameters():
-                    if p.grad is not None:
-                        p.grad *= slmadv_params.scale
-
-                for p in model.diffusion.parameters():
-                    if p.grad is not None:
-                        p.grad *= slmadv_params.scale
-
-                optimizer.step('bert_encoder')
-                optimizer.step('bert')
-                optimizer.step('predictor')
-                optimizer.step('diffusion')
-
-                # SLM discriminator loss
-                if d_loss_slm != 0:
-                    optimizer.zero_grad()
-                    d_loss_slm.backward(retain_graph=True)
-                    optimizer.step('wd')
-
+                d_loss_slm, loss_gen_lm = 0, 0
             else:
                 d_loss_slm, loss_gen_lm = 0, 0
-                
+                        
             iters = iters + 1
             
             if (i+1)%log_interval == 0:
-                logger.info ('Epoch [%d/%d], Step [%d/%d], Loss: %.5f, Disc Loss: %.5f, Dur Loss: %.5f, CE Loss: %.5f, Norm Loss: %.5f, F0 Loss: %.5f, LM Loss: %.5f, Gen Loss: %.5f, Sty Loss: %.5f, Diff Loss: %.5f, DiscLM Loss: %.5f, GenLM Loss: %.5f'
-                    %(epoch+1, epochs, i+1, len(train_list)//batch_size, running_loss / log_interval, d_loss, loss_dur, loss_ce, loss_norm_rec, loss_F0_rec, loss_lm, loss_gen_all, loss_sty, loss_diff, d_loss_slm, loss_gen_lm))
+                logger.info ('Epoch [%d/%d], Step [%d/%d], Loss: %.5f, Disc Loss: %.5f, Dur Loss: %.5f, CE Loss: %.5f, Norm Loss: %.5f, F0 Loss: %.5f, LM Loss: %.5f, Gen Loss: %.5f, DiscLM Loss: %.5f, GenLM Loss: %.5f'
+                    %(epoch+1, epochs, i+1, len(train_list)//batch_size, running_loss / log_interval, d_loss, loss_dur, loss_ce, loss_norm_rec, loss_F0_rec, loss_lm, loss_gen_all, d_loss_slm, loss_gen_lm))
                 
                 writer.add_scalar('train/mel_loss', running_loss / log_interval, iters)
                 writer.add_scalar('train/gen_loss', loss_gen_all, iters)
@@ -552,8 +455,6 @@ def main(config_path):
                 writer.add_scalar('train/slm_loss', loss_lm, iters)
                 writer.add_scalar('train/norm_loss', loss_norm_rec, iters)
                 writer.add_scalar('train/F0_loss', loss_F0_rec, iters)
-                writer.add_scalar('train/sty_loss', loss_sty, iters)
-                writer.add_scalar('train/diff_loss', loss_diff, iters)
                 writer.add_scalar('train/d_loss_slm', d_loss_slm, iters)
                 writer.add_scalar('train/gen_loss_slm', loss_gen_lm, iters)
                 
@@ -717,29 +618,17 @@ def main(config_path):
         else:
             # generating sampled speech from text directly
             with torch.no_grad():
-                # compute reference styles
-                if multispeaker and epoch >= diff_epoch:
-                    ref_ss = model.style_encoder(ref_mels.unsqueeze(1))
-                    ref_sp = model.predictor_encoder(ref_mels.unsqueeze(1))
-                    ref_s = torch.cat([ref_ss, ref_sp], dim=1)
-                    
+                # preview uses predicted durations from text, but since there's no
+                # diffusion model to sample a style from text alone, style is taken
+                # from the utterance's own ground-truth mel (as in the branch above)
                 for bib in range(len(d_en)):
-                    if multispeaker:
-                        s_pred = sampler(noise = torch.randn((1, 256)).unsqueeze(1).to(texts.device), 
-                              embedding=bert_dur[bib].unsqueeze(0),
-                              embedding_scale=1,
-                                features=ref_s[bib].unsqueeze(0), # reference from the same speaker as the embedding
-                                 num_steps=5).squeeze(1)
-                    else:
-                        s_pred = sampler(noise = torch.randn((1, 256)).unsqueeze(1).to(texts.device), 
-                              embedding=bert_dur[bib].unsqueeze(0),
-                              embedding_scale=1,
-                                 num_steps=5).squeeze(1)
+                    mel_length = int(mel_input_length[bib].item())
+                    gt_mel = mels[bib, :, :mel_length].unsqueeze(0).unsqueeze(1)
 
-                    s = s_pred[:, 128:]
-                    ref = s_pred[:, :128]
+                    ref = model.style_encoder(gt_mel)
+                    s = model.predictor_encoder(gt_mel)
 
-                    d = model.predictor.text_encoder(d_en[bib, :, :input_lengths[bib]].unsqueeze(0), 
+                    d = model.predictor.text_encoder(d_en[bib, :, :input_lengths[bib]].unsqueeze(0),
                                                      s, input_lengths[bib, ...].unsqueeze(0), text_mask[bib, :input_lengths[bib]].unsqueeze(0))
 
                     x, _ = model.predictor.lstm(d)
@@ -780,13 +669,6 @@ def main(config_path):
             }
             save_path = osp.join(log_dir, 'epoch_2nd_%05d.pth' % epoch)
             torch.save(state, save_path)
-            
-            # if estimate sigma, save the estimated simga
-            if model_params.diffusion.dist.estimate_sigma_data:
-                config['model_params']['diffusion']['dist']['sigma_data'] = float(np.mean(running_std))
-                
-                with open(osp.join(log_dir, osp.basename(config_path)), 'w') as outfile:
-                    yaml.dump(config, outfile, default_flow_style=True)
-        
+
 if __name__=="__main__":
     main()

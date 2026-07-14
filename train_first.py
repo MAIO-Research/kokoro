@@ -97,6 +97,9 @@ def main(config_path):
                                       device=device,
                                       dataset_config={})
     
+    model_params = recursive_munch(config['model_params'])
+    multispeaker = model_params.multispeaker
+
     with accelerator.main_process_first():
         # load pretrained ASR model
         ASR_config = config.get('ASR_config', False)
@@ -109,8 +112,7 @@ def main(config_path):
 
         # load BERT model
         from Utils.PLBERT.util import load_plbert
-        BERT_path = config.get('PLBERT_dir', False)
-        plbert = load_plbert(BERT_path)
+        plbert = load_plbert(model_params)
 
     scheduler_params = {
         "max_lr": float(config['optimizer_params'].get('lr', 1e-4)),
@@ -118,9 +120,7 @@ def main(config_path):
         "epochs": epochs,
         "steps_per_epoch": len(train_dataloader),
     }
-    
-    model_params = recursive_munch(config['model_params'])
-    multispeaker = model_params.multispeaker
+
     model = build_model(model_params, text_aligner, pitch_extractor, plbert)
 
     best_loss = float('inf')  # best test loss

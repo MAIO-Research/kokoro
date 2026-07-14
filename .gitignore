@@ -1,1 +1,8 @@
 __pycache__
+.venv/
+.cluade/
+Models/
+notebooks/
+.claude/
+.vscode/
+Data/

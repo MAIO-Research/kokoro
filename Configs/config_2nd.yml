@@ -1,4 +1,4 @@
-log_dir: "Models/telcell_female_hy"
+log_dir: "Models/telcell_female_hy_2nd"
 first_stage_path: "/mnt/filesystem-m3/workspace/armen/kokoro/Models/telcell_female_hy/epoch_1st_00160.pth"
 save_freq: 10
 log_interval: 10
@@ -6,7 +6,7 @@ device: "cuda"
 epochs_1st: 200 # number of epochs for first stage training (pre-training)
 epochs_2nd: 100 # number of peochs for second stage training (joint training)
 batch_size: 8
-max_len: 300 # maximum number of frames
+max_len: 400 # maximum number of frames
 pretrained_model: ""
 second_stage_load_pretrained: true # set to true if the pre-trained model is for 2nd stage
 load_only_params: false # set to true if do not want to load epoch numbers and optimizer parameters
@@ -97,7 +97,7 @@ loss_params:
     lambda_diff: 1. # score matching loss (2nd stage)
     
     diff_epoch: 20 # style diffusion starting epoch (2nd stage)
-    joint_epoch: 50 # joint training starting epoch (2nd stage)
+    joint_epoch: 30 # joint training starting epoch (2nd stage)
 
 optimizer_params:
   lr: 0.0001 # general learning rate
